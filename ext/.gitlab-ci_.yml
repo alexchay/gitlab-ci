@@ -1,0 +1,267 @@
+---
+
+# global variables
+variables:
+  # pulling only the current commit, not the whole git history
+  GIT_DEPTH: 1
+  CI_DEBUG_TRACE: "false"
+  # filesystem for the Docker build, which is faster and less space consuming
+  DOCKER_DRIVER: overlay2
+  # image tags
+  UV_IMAGE_TAG: python$PYTHON_VERSION-bookworm-slim
+
+# image-tags
+.image_gitlab_ci:
+  image: ${CI_REGISTRY}/${CI_REGISTRY_PATH}/gitlab-ci:$GITLAB_CI_REF_NAME
+  tags:
+    - docker-exec
+
+.image_python_base:
+  image: ${CI_REGISTRY}/${CI_REGISTRY_PATH}/python-base:$PYTHON_IMAGE_TAG
+  tags:
+    - docker-exec
+
+.image_python:
+  image: ${CI_REGISTRY}/${CI_REGISTRY_PATH}/python:$PYTHON_IMAGE_TAG
+  tags:
+    - docker-exec
+
+.image_uv:
+  image: ghcr.io/astral-sh/uv:$UV_IMAGE_TAG
+  tags:
+    - docker-exec
+
+.image_golang_base:
+  image: ${CI_REGISTRY}/${CI_REGISTRY_PATH}/golang-base:$GOLANG_IMAGE_TAG
+  tags:
+    - docker-exec
+
+.set_gitlab_ci_dir:
+  before_script:
+    - |
+      # if GITLAB_CI_DIR is not set, set it to current directory
+      if [ -z $GITLAB_CI_DIR ]; then
+          export GITLAB_CI_DIR=$(pwd)
+          export PATH=$GITLAB_CI_DIR/bin/:$PATH
+      fi
+
+.add_trusted_certs:
+  before_script:
+    - |
+      if [ ! -z $CI_SERVER_TLS_CA_FILE ]; then
+          echo "Adding trusted certs from $CI_SERVER_TLS_CA_FILE"
+          cat $CI_SERVER_TLS_CA_FILE > /usr/local/share/ca-certificates/ca.crt
+          cat $CI_SERVER_TLS_CA_FILE >> /etc/ssl/certs/ca-certificates.crt
+          # find in buildkitd.toml if the registry is already added
+          if [ -f buildkitd.toml ] && grep -q "registry.\"${CI_REGISTRY}\"" buildkitd.toml; then
+              echo "Registry ${CI_REGISTRY} already exists in buildkitd.toml, add only CA certs"
+              sed -i "/registry.\"${CI_REGISTRY}\"/a \  ca=[\"/usr/local/share/ca-certificates/ca.crt\"]" buildkitd.toml
+          else
+              echo "Adding registry ${CI_REGISTRY} and CA certs to buildkitd.toml"
+              echo "[registry.\"${CI_REGISTRY}\"]" >> buildkitd.toml
+              echo "  ca=[\"/usr/local/share/ca-certificates/ca.crt\"]" >> buildkitd.toml
+          fi
+      else
+          echo "CI_SERVER_TLS_CA_FILE is not set, skipping adding trusted certs"
+      fi
+
+# |------------------|--------------------|------------------|-------------------------------------|--------------------|
+# |   git ci action  | CI_COMMIT_REF_NAME | CI_COMMIT_BRANCH | CI_MERGE_REQUEST_SOURCE_BRANCH_NAME | CI_PIPELINE_SOURCE |
+# |------------------|--------------------|------------------|-------------------------------------|--------------------|
+# | branch commit    | branch name        | branch name      |                                     | push, api, web     |
+# | merge request    | source branch name |                  | source branch name                  | merge_request_event|
+# |------------------|--------------------|------------------|-------------------------------------|--------------------|
+
+
+####### WORKFLOW RULES ########
+.workflow_rules:
+  release:
+      # Always run for tags (releases)
+    - if: $CI_COMMIT_TAG
+  release_never:
+      # Never run for tags (releases)
+    - if: $CI_COMMIT_TAG
+      when: never
+  schedule:
+      # Always run for scheduled pipelines
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  workflow_dispatch:
+    - if: $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"
+  commit_branches:
+      # Always run for the default branch (e.g., main or master) and another branches
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH || $CI_COMMIT_BRANCH =~ /^(devel|feat|release|hotfix|fix).*/
+      when: always
+  merge_request:
+      # Never run for branch pushes that are part of an open merge request (avoids duplicate pipelines)
+    - if: $CI_OPEN_MERGE_REQUESTS && $CI_COMMIT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      when: never
+      # Always run for merge request pipelines
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_MERGE_REQUEST_IID
+  default:
+    - !reference [.workflow_rules, release]
+    - !reference [.workflow_rules, workflow_dispatch]
+    - !reference [.workflow_rules, merge_request]
+    - !reference [.workflow_rules, commit_branches]
+      # Fallback: never run (prevents pipelines for other branches)
+    - when: never
+
+
+####### OPTIMIZE PIPELINE RULES ########
+.optimize_pipeline_rules:
+  if_scripts_files_changed:
+    if: $CI_OPTIMIZE_PIPELINE == "true"
+    changes:
+      - bin/**/*
+      - scripts/**/*.sh
+  if_gitlab_ci_files_changed:
+    if: $CI_OPTIMIZE_PIPELINE == "true"
+    changes:
+      - .gitlab-ci.yml
+      - .gitlab/workflows/*.yml
+  otherwise_never:
+    if: $CI_OPTIMIZE_PIPELINE == "true"
+    when: never
+
+.rules:
+  validate_shell:
+    - !reference [.optimize_pipeline_rules, if_scripts_files_changed]
+    - !reference [.optimize_pipeline_rules, otherwise_never]
+    - when: always
+
+
+####### VAULT ########
+.prepare_vault:
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - echo "Preparing environment for Vault"
+    - !reference [.set_gitlab_ci_dir, before_script]
+    - . $GITLAB_CI_DIR/scripts/vault/generate_envconsul_config.sh
+    - |
+      if [ $GITLAB_CI_DIR != $(pwd) ]; then
+          mkdir -p bin/ || true
+          cp $GITLAB_CI_DIR/bin/envconsul bin/envconsul || true
+      fi
+  script:
+    - echo "Preparing environment for Vault"
+  artifacts:
+    name: "$CI_JOB_NAME"
+    when: always
+    paths:
+      - bin/envconsul
+      - .vault/envconsul.hcl
+    expire_in: 20m
+
+
+.vault_login:
+  before_script:
+    - |
+      # Login to Vault using the CI_JOB_JWT token
+      if [ ! -z $VAULT_ROLE ] && [ ! -z $VAULT_ADDR ]; then
+          set -e
+          apk add --no-cache curl jq || true
+          curl -4 $VAULT_ADDR/v1/sys/health
+          export VAULT_LOGIN_OUTPUT=$(curl -4 --request POST --data "{\"jwt\": \"$CI_JOB_JWT\", \"role\": \"$VAULT_ROLE\"}" $VAULT_ADDR/v1/auth/jwt/login)
+          export VAULT_TOKEN=$(echo $VAULT_LOGIN_OUTPUT | jq -r '.auth.client_token')
+          export VAULT_ACCESSOR=$(echo $VAULT_AUTH_OUTPUT | jq -r '.auth.accessor')
+          #
+          if [ -z $VAULT_TOKEN ] || [ $VAULT_TOKEN == "null" ]; then
+              echo "ERROR: \$VAULT_TOKEN is empty, could be a bad login.";
+              echo $VAULT_LOGIN_OUTPUT;
+              exit 1;
+          else
+              echo "\$VAULT_TOKEN is NOT empty, proceeding ..";
+          fi
+      fi
+
+
+.export_secrets_from_vault:
+  before_script:
+    - !reference [.set_gitlab_ci_dir, before_script]
+    - !reference [.vault_login, before_script]
+    - |
+      if [ -f .vault/envconsul.hcl ]; then
+        set -a
+        eval `envconsul -pristine -once -config .vault/envconsul.hcl env`
+        set +a
+      else
+        echo "WARNING: .vault/envconsul.hcl is missing"
+      fi
+
+
+####### LINUX SHELL ########
+.validate_shell:
+  image:
+    name: koalaman/shellcheck-alpine:latest
+    entrypoint: [ '/bin/sh', '-s' ]
+  stage: validate
+  needs: []
+  tags:
+    - docker-exec
+  before_script:
+    - shellcheck --version
+  script:
+    - echo 'Checking...' && find scripts -name '*.sh' -exec shellcheck {} + && echo 'Done'
+  rules: !reference [.rules, validate_shell]
+
+
+####### GIT ########
+.validate_git_commit:
+  stage: validate
+  needs: []
+  image:
+    name: commitlint/commitlint:latest
+    entrypoint: [ '/bin/bash', '-s' ]
+  tags:
+    - docker-exec
+  variables:
+    # pulling only last 20 commits, not the whole git history
+    GIT_DEPTH: 20
+  script:
+    - cat commitlint.config.js
+    - npx commitlint --from $CI_MERGE_REQUEST_DIFF_BASE_SHA --to HEAD --verbose --config commitlint.config.js --print-config
+  rules:
+    - if: "$CI_MERGE_REQUEST_EVENT_TYPE != 'merge_train' && $CI_MERGE_REQUEST_IID"
+
+
+####### CI PIPELINE ########
+.delete_release:
+  script:
+    - |-
+      # if one the variables exist and is not null, then delete the release
+      if [ ! -z $DELETE_RELEASE ] || [ ! -z $DELETE_EXISTING_RELEASE ]; then
+
+        # if the release name is not specified in the variable, then we will use CI_COMMIT_NAME as the default
+        if [ "$DELETE_RELEASE" = true ] ; then
+          DELETE_RELEASE=$CI_COMMIT_TAG
+        fi
+        if [ "$DELETE_EXISTING_RELEASE" = true  ] ; then
+          DELETE_EXISTING_RELEASE=$CI_COMMIT_TAG
+        fi
+        RELEASE_TAG=${DELETE_RELEASE:-$DELETE_EXISTING_RELEASE}; echo $RELEASE_TAG
+
+        # Set the API URL for the GitLab instance
+        RELEASES_API_URL=$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases; echo $RELEASES_API_URL
+
+        echo "GET a release by a tag name"
+        # Ignore if a command exits with a non-zero status
+        set +e;
+        response_code=$(curl --fail --connect-timeout 2 --retry 2 -o /dev/null -w %{http_code} --header "JOB-TOKEN: $CI_JOB_TOKEN" $RELEASES_API_URL/$RELEASE_TAG);
+        echo response_code=$response_code
+
+        # if the release exists, then delete it
+        if [[ $response_code == 200 ]]; then
+          echo "Release '$RELEASE_TAG' exists, deleting it..."
+          response_code=$(curl --fail --connect-timeout 2 --retry 2 -o /dev/null -w %{http_code} -X DELETE --header "JOB-TOKEN: $CI_JOB_TOKEN" $RELEASES_API_URL/$RELEASE_TAG)
+          echo response_code=$response_code
+          if [[ $response_code == 200 ]]; then
+            echo "Release '$RELEASE_TAG' deleted."
+          else
+            echo "Release '$RELEASE_TAG' could not be deleted."
+            exit 1
+          fi
+        else
+          echo "Release '$RELEASE_TAG' does not exist."
+        fi
+      fi

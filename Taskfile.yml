@@ -1,0 +1,59 @@
+# https://taskfile.dev
+version: "3"
+dotenv: ['.env']
+vars:
+  SET_VENV: uv run
+
+
+includes:
+  b2v:
+    taskfile: ./taskfiles/b2v.yml
+  docs:
+    taskfile: ./taskfiles/mkdocs.yml
+  pre-commit:
+    taskfile: ./taskfiles/pre-commit.yml
+  uv:
+    taskfile: ./taskfiles/uv.yml
+
+
+tasks:
+  env:
+    desc: Print environment variables
+    cmds:
+      - |
+        set -a; source .env; set +a;
+        env | grep -E '(HOME|PATH|IMAGE|DOCKER|TAG|PYTHON|REGISTRY|URL|CI_)'
+
+  install:
+    desc: Install current and required dependencies
+    cmds:
+      - uv sync --all-groups
+
+  bump-calver:
+    desc: Bump Cal version
+    cmds:
+      - task: bump-calver-patch
+
+  bump-calver-patch:
+    desc: Bump Cal version
+    cmds:
+      - uvx bump-my-version bump --verbose patch
+
+  bump-calver-release:
+    desc: Bump Cal version
+    cmds:
+      - uvx bump-my-version bump --verbose release
+
+  changelog:
+    desc: Generate changelog
+    cmds:
+      - >-
+        docker run --rm -it {{.DOCKER_RUN_ARGS}}
+        --entrypoint ""
+        ghcr.io/orhun/git-cliff/git-cliff:latest
+        sh -c "git-cliff --version && cd /build && git-cliff -r . --current -o /tmp/CHANGELOG.md && echo 'Changelog generated' && cat /tmp/CHANGELOG.md"
+
+  create-gh-release:
+    desc: Create GitHub release
+    cmds:
+      - gh release create $(uvx bump-my-version show current_version) --generate-notes

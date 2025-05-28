@@ -1,0 +1,125 @@
+---
+
+include:
+  - local: "/ext/.gitlab-ci_.yml"
+  - local: "/ext/.build_docker_image.yml"
+
+
+stages:
+  - validate
+  - build
+  - test
+  - release
+  - cleanup
+
+
+.optimize_pipeline_rules:
+  if_source_files_changed:
+    if: $CI_OPTIMIZE_PIPELINE == "true"
+    changes:
+      - src/**/*
+      - tests/**/*
+      - pyproject.toml
+      - poetry.lock
+      - uv.lock
+
+.tasks:
+  install_gotask:
+    - >-
+      if [ ! -f "$HOME/.local/bin/task" ]; then
+        mkdir -p $HOME/.local/bin && uv tool install go-task-bin
+      fi;
+    - export PATH="$HOME/.local/bin:$PATH"
+    - task --version
+
+  install_with_dev:
+    - >-
+      if [ -f "pyproject.toml" ]; then
+        mkdir $HOME/app && cp -r . $HOME/app && cd $HOME/app;
+        # if the .python-version file exists, remove it to avoid conflicts and use system python version
+        if [ -f ".python-version" ]; then rm .python-version || true; fi;
+        uv sync --locked --group dev
+      fi;
+
+  install_with_test:
+    - >-
+      if [ -f "pyproject.toml" ]; then
+        mkdir $HOME/app && cp -r . $HOME/app && cd $HOME/app;
+        # if the .python-version file exists, remove it to avoid conflicts and use system python version
+        if [ -f ".python-version" ]; then rm .python-version || true; fi;
+        uv sync --locked --group test
+      fi;
+
+  install_with_devtest:
+    - >-
+      if [ -f "pyproject.toml" ]; then
+        mkdir $HOME/app && cp -r . $HOME/app && cd $HOME/app;
+        # if the .python-version file exists, remove it to avoid conflicts and use system python version
+        if [ -f ".python-version" ]; then rm .python-version || true; fi;
+        uv sync --locked --group dev --group test
+      fi;
+
+
+.static_analysis:
+  extends:
+    - .image_uv
+  variables:
+    GIT_STRATEGY: clone
+  environment:
+    action: prepare
+    name: testing
+  before_script:
+    - !reference [.tasks, install_gotask]
+    - !reference [.tasks, install_with_dev]
+  script:
+    - cd $HOME/app
+    - task static-analysis
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+
+.pytesting:
+  extends:
+    - .image_uv
+  variables:
+    GIT_STRATEGY: clone
+  environment:
+    action: prepare
+    name: testing
+  before_script:
+    - !reference [.tasks, install_gotask]
+    - !reference [.tasks, install_with_test]
+  script:
+    - cd $HOME/app
+    - task pytest:all-cov
+    - cd $CI_PROJECT_DIR
+    - mv $HOME/app/test-reports/htmlcov htmlcov || true
+    - mv $HOME/app/test-reports/coverage.xml coverage.xml || true
+  coverage: '/^TOTAL.+?(\d+\%).*/'
+  artifacts:
+    name: "$CI_JOB_NAME"
+    when: always
+    reports:
+      junit: coverage.xml
+    paths:
+      - htmlcov/
+    expire_in: 20min
+
+.build_package:
+  extends:
+    - .image_python
+  stage: build
+  variables:
+    GIT_STRATEGY: clone
+  script:
+    - python -V
+    # avoid the fatal error: detected dubious ownership in repository
+    - git config --global --add safe.directory '*' && git config --global --add safe.file '*' && git config --global --add safe.filemode false
+    - task build
+  dependencies: []
+  artifacts:
+    name: "$CI_JOB_NAME"
+    when: on_success
+    paths:
+      - dist/
+    expire_in: 20m

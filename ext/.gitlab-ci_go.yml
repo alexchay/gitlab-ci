@@ -1,0 +1,88 @@
+---
+
+include:
+  - local: "/ext/.gitlab-ci_.yml"
+  - local: "/ext/.build_docker_image.yml"
+
+stages:
+  - validate
+  - build
+  - test
+  - release
+  - cleanup
+
+variables:
+  VALIDATE_GOMOD_IMAGE: ${CI_REGISTRY_IMAGE}/validate_gomod:${GOLANG_IMAGE_TAG}
+
+.image_validate_gomod:
+  image: ${VALIDATE_GOMOD_IMAGE}
+  tags:
+    - docker-exec
+
+.create_validate_gomod_image:
+  extends:
+    - .build_image
+  before_script:
+    - !reference [.docker_login_with_job_token, before_script]
+  variables:
+    # To figure out that the Dockerfile was changed, we need to clone the repository with a depth of 2.
+    GIT_DEPTH: 2
+  script:
+    - if [ -n "$GO_PROXY" ]; then export GOPROXY=$GO_PROXY && echo $GOPROXY; fi
+    # Ignore if a command exits with a non-zero status
+    - set +e;
+    # check if an image exists in the project' container registry and go.mod file was changed in last git commit
+    - |-
+      docker manifest inspect $VALIDATE_GOMOD_IMAGE > /dev/null 2>&1; GOMOD_IMAGE_NOT_EXISTS=$?
+      git diff --name-only HEAD~1 HEAD | grep Dockerfile_gomod > /dev/null 2>&1; DOCKERFILE_NOT_CHANGED=$?
+      git diff --name-only HEAD~1 HEAD | grep go.mod > /dev/null 2>&1; GOMOD_NOT_CHANGED=$?
+      if [ $GOMOD_IMAGE_NOT_EXISTS -eq 1 ] || [ $DOCKERFILE_NOT_CHANGED -eq 0 ] || [ $GOMOD_NOT_CHANGED -eq 0 ]; then
+        echo "Building image $VALIDATE_GOMOD_IMAGE"
+        if [ "$DOCKER_CACHE" = true ] ; then docker pull $VALIDATE_GOMOD_IMAGE || true ; fi
+        docker build \
+        --build-arg HTTP_PROXY \
+        --build-arg HTTPS_PROXY \
+        --build-arg NO_PROXY \
+        --build-arg GOPROXY \
+        --build-arg CI_REGISTRY=$CI_REGISTRY/$CI_REGISTRY_PATH \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        --build-arg GOLANG_IMAGE_TAG \
+        --cache-from $VALIDATE_GOMOD_IMAGE -t $VALIDATE_GOMOD_IMAGE -f Dockerfile_gomod .;
+        docker push $VALIDATE_GOMOD_IMAGE
+        docker image inspect $VALIDATE_GOMOD_IMAGE --format='{{.Size}}' | awk '{ size = $1 /1024 /1024; print "Image size=" size "MB" }'
+      else
+        echo "Image $VALIDATE_GOMOD_IMAGE exists and Dockerfile & go.mod files were not changed. Skipping build."
+        exit 0
+      fi
+  after_script:
+    - docker logout $CI_REGISTRY
+  rules:
+    - exists:
+      - Dockerfile_gomod
+
+.build_go_app:
+  extends:
+    - .image_golang_base
+  stage: build
+  environment:
+    action: prepare
+    name: building
+  before_script:
+    - if [ -n "$GO_PROXY" ]; then export GOPROXY=$GO_PROXY; go env -w GOPROXY=$GOPROXY && echo $GOPROXY; fi
+    - >-
+      if [ -f "go.mod" ] || [ -f "go.sum" ]; then
+        go mod tidy -e;
+        go mod download && go mod verify;
+        for var in $GO_BUILD_VARS; do export "$var"; done
+      fi;
+  script:
+    # avoid the fatal error: detected dubious ownership in repository
+    - git config --global --add safe.directory '*' && git config --global --add safe.file '*' && git config --global --add safe.filemode false
+    # build
+    - go build $GO_BUILD_FLAGS -v -trimpath -ldflags "-s -w -X main.version=$CI_COMMIT_TAG -X main.commit=$CI_COMMIT_SHORT_SHA -extldflags '-static'" -o app;
+  artifacts:
+    name: "$CI_JOB_NAME"
+    when: always
+    paths:
+      - app
+    expire_in: 20min

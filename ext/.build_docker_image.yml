@@ -1,0 +1,308 @@
+---
+include:
+  - local: "/ext/.gitlab-ci_.yml"
+
+stages:
+  - validate
+  - build
+  - test
+  - release
+  - cleanup
+
+# docker variables:
+variables:
+  # filesystem for the Docker build, which is faster and less space consuming
+  DOCKER_DRIVER: overlay2
+  DOCKER_CACHE: 1
+  DOCKER_BUILDKIT: 1
+  # By default, the Docker images we create run on the linux/amd64 platform
+  # PLATFORMS: linux/amd64,linux/arm64
+  DEFAULT_PLATFORMS: linux/amd64
+  # When TLS is enabled, the Docker daemon will be started with --host=tcp://0.0.0.0:2376
+  DOCKER_HOST: tcp://docker:2376
+  BUILD_IMAGE_SHA: $CI_REGISTRY/$CI_REGISTRY_PATH/$BUILD_IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+  RELEASE_IMAGE: $CI_REGISTRY/$CI_REGISTRY_PATH/$BUILD_IMAGE_NAME:$BUILD_IMAGE_TAG
+  BRANCH_IMAGE: $CI_REGISTRY/$CI_REGISTRY_PATH/$BUILD_IMAGE_NAME:$CI_COMMIT_REF_NAME
+  CI_REGISTRY_TLS_VERIFY: $CI_REGISTRY_TLS_VERIFY
+
+.artifacts_tmpl:
+  dependencies: []
+  artifacts:
+    name: "$CI_JOB_NAME"
+    when: always
+    paths:
+      - log/
+
+.dind_services:
+  services:
+    - name: docker:$DIND_IMAGE_TAG
+      alias: docker
+      variables:
+        HEALTHCHECK_TCP_PORT: '2376'
+      entrypoint: ["/bin/sh", "-c"]
+      command:
+        - |
+          # If TLS verification is disabled, add CI_REGISTRY to insecure registries.
+          if [ "$CI_REGISTRY_TLS_VERIFY" = "0" ]; then
+            mkdir -p /etc/docker/;
+            echo "{ \"insecure-registries\":[\"$CI_REGISTRY\"] }" > /etc/docker/daemon.json;
+          fi
+          mkdir -p /etc/docker/certs.d/$CI_REGISTRY/
+          echo "$CI_SERVER_TLS_CA_FILE" > /etc/docker/certs.d/$CI_REGISTRY/rca.crt || exit
+          dockerd-entrypoint.sh || exit
+
+
+.docker_login_with_job_token:
+  before_script:
+    # Limit the access scope of a project's CI/CD job token to increase the job token's security.
+    # Add only the "devops/gitlab" project to the access scope.
+    - echo $CI_JOB_TOKEN | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+
+.docker_login_with_vault:
+  before_script:
+    # You can export secrets from Vault to the CI/CD environment variables to get access to the global container registry.
+    - !reference [.export_secrets_from_vault, before_script]
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+
+.optimize_pipeline_rules:
+  if_dockerfile_exists:
+    exists:
+      - Dockerfile
+  if_dockerfile_changed:
+    if: $CI_OPTIMIZE_PIPELINE == "true"
+    changes:
+      - Dockerfile
+  if_dockerfile_changed_never:
+    if: $CI_OPTIMIZE_PIPELINE == "true"
+    changes:
+      - Dockerfile
+    when: never
+
+.rules:
+  validate_dockerfile:
+    - !reference [.optimize_pipeline_rules, if_dockerfile_changed]
+    - !reference [.optimize_pipeline_rules, otherwise_never]
+    - when: always
+
+
+.resource_groups:
+  oldest_first_to_group_commit_sha:
+    - >-
+      if [ -n "$CI_PROJECT_API_TOKEN" ]; then
+        echo "Change the process mode of a resource group to 'oldest_first'";
+        curl -4 -k --header "PRIVATE-TOKEN: $CI_PROJECT_API_TOKEN" --request PUT --data "process_mode=oldest_first" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/resource_groups/$CI_COMMIT_SHORT_SHA";
+      fi
+
+
+.validate_dockerfile:
+  image: hadolint/hadolint:latest-alpine
+  stage: validate
+  needs: []
+  tags:
+    - docker-exec
+  before_script:
+    - hadolint --version
+  script:
+    - echo "Checking..." && hadolint Dockerfile && echo "Done"
+  rules: !reference [.rules, validate_dockerfile]
+
+
+.prepare_docker_buildkit:
+  before_script:
+    - |
+      echo "Prepare a configuration file buildkitd.toml"
+      if [ "$DOCKER_BUILD_DEBUG" = "1" ]; then echo debug = true >> buildkitd.toml; fi
+      if [ "$CI_REGISTRY_TLS_VERIFY" = "0" ]; then
+          if [ -f buildkitd.toml ] && grep -q "registry.\"${CI_REGISTRY}\"" buildkitd.toml; then
+              echo "Registry ${CI_REGISTRY} already exists in buildkitd.toml, add only http=true"
+              sed -i "/registry.\"${CI_REGISTRY}\"/a \  http=true" buildkitd.toml
+          else
+              echo "Adding registry ${CI_REGISTRY} to buildkitd.toml and mention to use http only"
+              echo "[registry.\"${CI_REGISTRY}\"]" >> buildkitd.toml
+              echo "  http=true" >> buildkitd.toml
+          fi
+      fi
+      echo "=========== buildkitd.toml ==========="
+      cat buildkitd.toml
+
+
+.build_image:
+  # Official docker image.
+  image: docker:$DOCKER_IMAGE_TAG
+  stage: build
+  extends:
+     - .dind_services
+     - .artifacts_tmpl
+  tags:
+    - docker-builder
+  variables:
+    GIT_STRATEGY: clone
+  before_script:
+    - !reference [.add_trusted_certs, before_script]
+    - !reference [.prepare_docker_buildkit, before_script]
+    - !reference [.docker_login_with_vault, before_script]
+    # See https://www.docker.com/blog/multi-platform-docker-builds/
+    - time docker run --privileged tonistiigi/binfmt:qemu-v9.2.2
+    - docker context create builder
+    - docker buildx create builder --use --config buildkitd.toml --buildkitd-flags \
+      '--allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host' --driver-opt network=host
+    - docker buildx inspect --bootstrap
+    - docker buildx ls
+  script:
+    # NOTE: disable provenance for now
+    # because it causes troubles with the registry and older clients.
+    # See
+    # - https://gitlab.com/gitlab-org/terraform-images/-/issues/104
+    # - https://gitlab.com/gitlab-org/terraform-images/-/merge_requests/184#note_1328485943
+    - |
+      set -x;
+      if [ "$DOCKER_CACHE" = "1" ]; then
+        export DOCKER_CACHE_ARGS="--cache-from $CACHE_IMAGE --cache-to type=registry,ref=$CACHE_IMAGE,mode=max"
+      fi
+      time docker buildx build --push \
+      --platform "${PLATFORMS:=$DEFAULT_PLATFORMS}" \
+      --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY \
+      --build-arg BUILDKIT_INLINE_CACHE=1 \
+      $DOCKER_BUILD_ARGS \
+      $DOCKER_CACHE_ARGS \
+      --provenance=false \
+      --progress plain   \
+      --network=host     \
+      -t $BUILD_IMAGE_SHA .
+    - docker buildx imagetools inspect $BUILD_IMAGE_SHA
+  after_script:
+    - docker logout $CI_REGISTRY
+  rules:
+    - exists:
+        - Dockerfile
+
+
+.test_image:
+  extends:
+    - .artifacts_tmpl
+  image: $BUILD_IMAGE_SHA
+  stage: test
+  tags:
+    - docker-exec
+  variables:
+    GIT_STRATEGY: clone
+
+
+.tag_image:
+  image:
+    name: gcr.io/go-containerregistry/crane:debug
+    entrypoint: [""]
+  before_script:
+    #- !reference [.export_secrets_from_vault, before_script]
+    - crane auth login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - if [ "$CI_REGISTRY_TLS_VERIFY" = "0" ]; then export REGISTRY_INSECURE=" --insecure"; fi
+    - crane $REGISTRY_INSECURE tag $BUILD_IMAGE_SHA $BUILD_IMAGE_TAG
+    - crane $REGISTRY_INSECURE manifest $RELEASE_IMAGE
+    - |
+      if [ -n "$BUILD_IMAGE_TAGS" ]; then
+        OLD_IFS="$IFS"
+        IFS=','
+        set -- $BUILD_IMAGE_TAGS
+        IFS="$OLD_IFS"
+        for image_tag; do
+          trimmed_tag=$(echo "$image_tag" | xargs)
+          crane $REGISTRY_INSECURE tag $BUILD_IMAGE_SHA "$trimmed_tag"
+        done
+      fi
+
+
+.changelog:
+  stage: release
+  rules:
+    - if: $CI_COMMIT_TAG
+  image:
+    name: ghcr.io/orhun/git-cliff/git-cliff:latest
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: clone # clone entire repo instead of reusing workspace
+    GIT_DEPTH: 0 # avoid shallow clone to give cliff all the info it needs
+  script:
+    - git-cliff -r . --current -o CHANGELOG.md
+  artifacts:
+    paths:
+      - CHANGELOG.md
+
+.release:
+  stage: release
+  rules:
+    - if: $CI_COMMIT_TAG
+  needs:
+    - job: changelog
+      artifacts: true
+      optional: false
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - docker-exec
+  variables:
+    GIT_STRATEGY: clone
+  before_script:
+    - glab -v && release-cli -v && git -v
+    - apk add --no-cache curl jq || true
+  script:
+    - !reference [.delete_release, script]
+    - echo "Creating gitlab release page for release version ${CI_COMMIT_TAG}"
+  release:
+    name: "$CI_COMMIT_TAG"
+    tag_name: "$CI_COMMIT_TAG"
+    description: CHANGELOG.md
+    ref: "$CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: 'Container Images for $CI_COMMIT_TAG'
+          url: "$CI_SERVER_URL/$CI_REGISTRY_PATH/container_registry"
+
+
+
+.cleanup_build:
+  stage: cleanup
+  when: always
+  # Official docker image.
+  image: docker:$DOCKER_IMAGE_TAG
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - apk add --no-cache curl jq || true
+  script:
+    - set +x
+    - IMAGE_NAME=$(echo $BUILD_IMAGE_SHA | sed -e 's/.*\/\(.*\)\:\(.*\)$/\1/'); echo $IMAGE_NAME
+    - IMAGE_TAG=$(echo $BUILD_IMAGE_SHA | sed -e 's/.*\/\(.*\)\:\(.*\)$/\2/'); echo $IMAGE_TAG
+    - CI_REGISTRY_PROJECT_ID=${CI_REGISTRY_PROJECT_ID:-$CI_PROJECT_ID}; echo $CI_REGISTRY_PROJECT_ID
+    - |
+      # set the page size and initial page number
+      # https://docs.gitlab.com/ee/api/README.html#pagination
+      # https://docs.gitlab.com/ee/api/README.html#offset-based-pagination
+      #
+      PAGE_SIZE=20
+      PAGE_NUMBER=1
+
+      # Loop through all the pages
+      while true; do
+        # Make a request to the API to get the repositories for the registry
+        LIST_REPOS=$(curl -4 -k --header "PRIVATE-TOKEN: $CI_REGISTRY_PASSWORD" "$CI_API_V4_URL/projects/$CI_REGISTRY_PROJECT_ID/registry/repositories?page=$PAGE_NUMBER&per_page=$PAGE_SIZE")
+        # If the list of repositories is empty or equals to [], then exit
+        if [ -z "$LIST_REPOS" ] || [ "$LIST_REPOS" = "[]" ]; then
+          echo "No more repositories found."
+          break
+        fi
+        echo $LIST_REPOS
+
+        # Get the repository ID for the image name
+        CI_REGISTRY_REPOSITORY_ID=$(echo $LIST_REPOS | jq '.[] | select(.name=="'${IMAGE_NAME}'") .id' || true); echo "$CI_REGISTRY_REPOSITORY_ID"
+        # If the repository ID is not empty, then delete the image tag and exit
+        if [ -n "$CI_REGISTRY_REPOSITORY_ID" ]; then
+          curl -4 -k --request DELETE --header "PRIVATE-TOKEN: $CI_REGISTRY_PASSWORD" \
+          "$CI_API_V4_URL/projects/$CI_REGISTRY_PROJECT_ID/registry/repositories/$CI_REGISTRY_REPOSITORY_ID/tags/$IMAGE_TAG" | jq || true
+          break
+        fi
+        # Increment the page number
+        PAGE_NUMBER=$((PAGE_NUMBER + 1))
+
+        # Add a delay to avoid overwhelming the API
+        sleep 1
+      done
