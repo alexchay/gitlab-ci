@@ -1,6 +1,6 @@
 [project]
 name = "gitlab-ci"
-version = "2025.05.31.0"
+version = "2025.06.10.0"
 description = "Collection of Gitlab CI/CD workflow templates"
 readme = "README.md"
 authors = [
@@ -62,7 +62,7 @@ annotated_tag = false
 
 
 [tool.bumpversion]
-current_version = "2025.05.31.0"
+current_version = "2025.06.10.0"
 parse = """(?x)                      # Verbose mode
     (?P<release>                     # The release part
         (?:[1-9][0-9]{3})\\.         # "{YYYY}".
