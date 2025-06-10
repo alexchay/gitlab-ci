@@ -12,7 +12,6 @@ stages:
   - release
   - cleanup
 
-
 .optimize_pipeline_rules:
   if_source_files_changed:
     if: $CI_OPTIMIZE_PIPELINE == "true"
@@ -38,7 +37,7 @@ stages:
         mkdir $HOME/app && cp -r . $HOME/app && cd $HOME/app;
         # if the .python-version file exists, remove it to avoid conflicts and use system python version
         if [ -f ".python-version" ]; then rm .python-version || true; fi;
-        uv sync --locked --group dev
+        uv sync --group dev
       fi;
 
   install_with_test:
@@ -47,7 +46,7 @@ stages:
         mkdir $HOME/app && cp -r . $HOME/app && cd $HOME/app;
         # if the .python-version file exists, remove it to avoid conflicts and use system python version
         if [ -f ".python-version" ]; then rm .python-version || true; fi;
-        uv sync --locked --group test
+        uv sync --group test
       fi;
 
   install_with_devtest:
@@ -56,13 +55,14 @@ stages:
         mkdir $HOME/app && cp -r . $HOME/app && cd $HOME/app;
         # if the .python-version file exists, remove it to avoid conflicts and use system python version
         if [ -f ".python-version" ]; then rm .python-version || true; fi;
-        uv sync --locked --group dev --group test
+        uv sync --group dev --group test
       fi;
 
 
 .static_analysis:
-  extends:
-    - .image_uv
+  image: ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim
+  tags:
+    - docker-exec
   variables:
     GIT_STRATEGY: clone
   environment:
@@ -79,8 +79,9 @@ stages:
 
 
 .pytesting:
-  extends:
-    - .image_uv
+  image: ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim
+  tags:
+    - docker-exec
   variables:
     GIT_STRATEGY: clone
   environment:

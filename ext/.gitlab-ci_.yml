@@ -7,8 +7,6 @@ variables:
   CI_DEBUG_TRACE: "false"
   # filesystem for the Docker build, which is faster and less space consuming
   DOCKER_DRIVER: overlay2
-  # image tags
-  UV_IMAGE_TAG: python$PYTHON_VERSION-bookworm-slim
 
 # image-tags
 .image_gitlab_ci:
@@ -23,11 +21,6 @@ variables:
 
 .image_python:
   image: ${CI_REGISTRY}/${CI_REGISTRY_PATH}/python:$PYTHON_IMAGE_TAG
-  tags:
-    - docker-exec
-
-.image_uv:
-  image: ghcr.io/astral-sh/uv:$UV_IMAGE_TAG
   tags:
     - docker-exec
 
