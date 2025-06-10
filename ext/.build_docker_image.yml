@@ -1,6 +1,6 @@
 ---
-include:
-  - local: "/ext/.gitlab-ci_.yml"
+# include:
+#   - local: "/ext/.gitlab-ci_.yml"
 
 stages:
   - validate

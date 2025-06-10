@@ -1,8 +1,8 @@
 ---
 
-include:
-  - local: "/ext/.gitlab-ci_.yml"
-  - local: "/ext/.build_docker_image.yml"
+# include:
+#   - local: "/ext/.gitlab-ci_.yml"
+#   - local: "/ext/.build_docker_image.yml"
 
 stages:
   - validate
