@@ -13,7 +13,7 @@ tasks:
     cmds:
       - uvx bump-my-version show current_version
 
-  show-next-build:
+  show-next-release:
     desc: Show the next version
     cmds:
-      - uvx bump-my-version show --increment build new_version
+      - uvx bump-my-version show --increment release new_version
