@@ -10,7 +10,7 @@ You can include these templates in your own `.gitlab-ci.yml`:
 
 ```yaml
 include:
-  - remote: '$GITLAB_CI_URL'
+  - remote: '$GITLAB_CI_URL/refs/heads/$GITLAB_CI_REF_NAME/ext/.gitlab-ci_py.yml'
     rules:
       - if: $GITLAB_CI_URL
   - project: '$GITLAB_CI_PATH'
