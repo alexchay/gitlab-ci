@@ -5,8 +5,7 @@ variables:
   # pulling only the current commit, not the whole git history
   GIT_DEPTH: 1
   CI_DEBUG_TRACE: "false"
-  # filesystem for the Docker build, which is faster and less space consuming
-  DOCKER_DRIVER: overlay2
+
 
 # image-tags
 .image_gitlab_ci:
